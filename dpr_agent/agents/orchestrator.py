@@ -293,7 +293,7 @@ class Orchestrator:
             business_description=self._intake_description,
             industry=self.store.project_profile.industry,
             location=self._intake_location,
-            project_cost_lakhs=self.store.capital_means.total_cost,
+            project_cost_lakhs=self.store.capital_means.total_project_cost,
         )
 
         # ── Step 5: Mark sections complete if all fields present, advance ─────
