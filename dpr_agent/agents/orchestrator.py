@@ -180,6 +180,12 @@ class Orchestrator:
 
         response = await handler(user_message)
 
+        # Guard against handler returning None
+        if response is None:
+            response = OrchestratorResponse(
+                message="Sorry, something went wrong processing that. Could you repeat?"
+            )
+
         # Track tier2 state on the orchestrator instance
         if response.awaiting_tier2:
             self._awaiting_tier2 = response.awaiting_tier2
@@ -590,6 +596,23 @@ Respond ONLY with JSON. Include ONLY fields explicitly mentioned.
             self._apply_costs_fields(extracted)
         except Exception as e:
             print(f"[costs extraction] failed: {e} | raw response: {raw[:300]}")
+
+        missing = self._missing_costs_fields()
+        if not missing:
+            tier2_msg = await self._present_tier2_for_section("costs", user_message)
+            if tier2_msg:
+                return OrchestratorResponse(message=tier2_msg,
+                                             awaiting_tier2="costs")
+            self.store.cost_structure.status = SectionStatus.COMPLETE
+            self.current_section = "manpower"
+            return OrchestratorResponse(
+                message=f"✅ Cost structure complete.\n\n---\n\n{self._first_question_for('manpower')}",
+                section_completed="costs",
+                next_section="manpower",
+            )
+        return OrchestratorResponse(
+            message=self._ask_for_missing_costs(missing)
+        )
 
     async def _handle_manpower(self, user_message: str) -> "OrchestratorResponse":
         """Extract manpower fields."""
