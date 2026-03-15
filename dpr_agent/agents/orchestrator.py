@@ -384,44 +384,31 @@ Respond ONLY with JSON. Include ONLY fields explicitly mentioned.
 
     async def _handle_costs(self, user_message: str) -> "OrchestratorResponse":
         """Extract cost structure fields."""
-        extraction_prompt = f"""Extract cost structure information.
-
-Current raw materials: {json.dumps([{"name":m.name,"unit":m.unit,"price":m.price_per_unit,"input_per_output":m.input_per_output_unit,"escalation":m.price_escalation_pa} for m in self.store.cost_structure.raw_materials], indent=2)}
-Current costs: transport={self.store.cost_structure.transport_base_lakhs}, misc={self.store.cost_structure.misc_base_lakhs}
-
-User message: "{user_message}"
-
-Extract:
-- raw_materials: list of {{"name":"...", "unit":"...", "price_per_unit":<n>, "input_per_output_unit":<n>, "price_escalation_pa":<fraction>}}
-- transport_base_lakhs: <number>
-- misc_base_lakhs: <number>
-
-Respond ONLY with JSON.
-{{"raw_materials":[], "transport_base_lakhs":null, "misc_base_lakhs":null}}"""
+        extraction_prompt = (
+            "Extract cost structure information from the user message.\n\n"
+            f"Already captured raw materials: {__import__('json').dumps([{'name':m.name,'unit':m.unit,'price':m.price_per_unit,'input_per_output':m.input_per_output_unit} for m in self.store.cost_structure.raw_materials])}\n"
+            f"Current: transport={self.store.cost_structure.transport_base_lakhs}, misc={self.store.cost_structure.misc_base_lakhs}\n\n"
+            f'User message: "{user_message}"\n\n'
+            "Extract ALL raw materials mentioned. For each:\n"
+            "  - name: string\n"
+            "  - unit: string (kg, pieces, litres, rolls, etc.)\n"
+            "  - price_per_unit: number (INR, no symbols)\n"
+            "  - input_per_output_unit: number (quantity of this input per 1 finished unit)\n"
+            "  - price_escalation_pa: number (default 0.05)\n"
+            "Also extract transport_base_lakhs and misc_base_lakhs as numbers (null if not mentioned).\n\n"
+            "IMPORTANT: price_per_unit must be a plain number like 180 not rupee symbol.\n"
+            "IMPORTANT: input_per_output_unit must be a plain number like 1.2.\n"
+            "IMPORTANT: If user lists 5 materials return all 5.\n\n"
+            'Respond ONLY with JSON: {"raw_materials":[{"name":"...","unit":"...","price_per_unit":0,"input_per_output_unit":0,"price_escalation_pa":0.05}],"transport_base_lakhs":null,"misc_base_lakhs":null}'
+        )
 
         raw = await self._llm_call(extraction_prompt, system=self._extraction_system())
         try:
-            extracted = json.loads(self._clean_json(raw))
+            import json as _json
+            extracted = _json.loads(self._clean_json(raw))
             self._apply_costs_fields(extracted)
-        except Exception:
-            pass
-
-        missing = self._missing_costs_fields()
-        if not missing:
-            tier2_msg = await self._present_tier2_for_section("costs", user_message)
-            if tier2_msg:
-                return OrchestratorResponse(message=tier2_msg,
-                                             awaiting_tier2="costs")
-            self.store.cost_structure.status = SectionStatus.COMPLETE
-            self.current_section = "manpower"
-            return OrchestratorResponse(
-                message=f"✅ Cost structure complete.\n\n---\n\n{self._first_question_for('manpower')}",
-                section_completed="costs",
-                next_section="manpower",
-            )
-        return OrchestratorResponse(
-            message=self._ask_for_missing_costs(missing)
-        )
+        except Exception as e:
+            print(f"[costs extraction] failed: {e} | raw response: {raw[:300]}")
 
     async def _handle_manpower(self, user_message: str) -> "OrchestratorResponse":
         """Extract manpower fields."""
