@@ -127,7 +127,46 @@ class Orchestrator:
         """
         self.history.append(ConversationTurn("user", user_message))
 
-        # Dispatch to the right handler
+        # ── Tier 2 interception ───────────────────────────────────────────────
+        # If we are awaiting a tier2 response, handle it first before
+        # dispatching to section handlers — otherwise the section handler
+        # loops and re-presents the same tier2 question indefinitely.
+        if hasattr(self, "_awaiting_tier2") and self._awaiting_tier2:
+            section = self._awaiting_tier2
+            self._awaiting_tier2 = ""
+            await self._apply_tier2_responses(section, user_message)
+
+            # Advance to next section
+            next_section_map = {
+                "revenue":  "costs",
+                "costs":    "manpower",
+                "manpower": "finance",
+                "finance":  "confirm",
+            }
+            next_sec = next_section_map.get(section, "confirm")
+
+            # Mark current section complete
+            section_store_map = {
+                "revenue":  self.store.revenue_model,
+                "costs":    self.store.cost_structure,
+                "manpower": self.store.manpower,
+                "finance":  self.store.finance_wc,
+            }
+            sec_store = section_store_map.get(section)
+            if sec_store:
+                sec_store.status = SectionStatus.COMPLETE
+
+            self.current_section = next_sec
+            first_q = self._first_question_for(next_sec)
+            response = OrchestratorResponse(
+                message=f"✅ {section.title()} complete.\n\n---\n\n{first_q}",
+                section_completed=section,
+                next_section=next_sec,
+            )
+            self.history.append(ConversationTurn("assistant", response.message))
+            return response
+
+        # ── Normal section dispatch ───────────────────────────────────────────
         handler = {
             "intake":   self._handle_intake,
             "profile":  self._handle_profile,
@@ -140,6 +179,11 @@ class Orchestrator:
         }.get(self.current_section, self._handle_intake)
 
         response = await handler(user_message)
+
+        # Track tier2 state on the orchestrator instance
+        if response.awaiting_tier2:
+            self._awaiting_tier2 = response.awaiting_tier2
+
         self.history.append(ConversationTurn("assistant", response.message))
         return response
 
