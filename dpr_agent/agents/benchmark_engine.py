@@ -154,22 +154,15 @@ class BenchmarkEngine:
     ) -> dict[str, Benchmark]:
         """Synchronous version for non-async contexts."""
         import asyncio
+        import concurrent.futures
+        def _run():
+            return asyncio.run(
+                self.generate(business_description, industry,
+                              location, project_cost_lakhs)
+            )
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(
-                        asyncio.run,
-                        self.generate(business_description, industry,
-                                      location, project_cost_lakhs)
-                    )
-                    return future.result(timeout=30)
-            else:
-                return loop.run_until_complete(
-                    self.generate(business_description, industry,
-                                  location, project_cost_lakhs)
-                )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(_run).result(timeout=30)
         except Exception as e:
             print(f"[BenchmarkEngine] Sync wrapper failed: {e}. Using fallbacks.")
             return self._build_fallbacks()
