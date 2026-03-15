@@ -191,61 +191,242 @@ class Orchestrator:
 
     async def _handle_intake(self, user_message: str) -> "OrchestratorResponse":
         """
-        Intake: understand the business, detect type, call Benchmark Engine.
+        Intake: detect business type, run benchmarks, then greedily extract
+        ALL sections from the first message. Only ask for what is missing.
         """
-        extraction_prompt = f"""The user has described their business. Extract:
-1. business_description: A clean 1-2 sentence description of the business
-2. industry: The specific industry/sector (e.g. "Edible Oil Processing", "Cold Storage", "Diagnostic Clinic")
-3. business_type: One of MANUFACTURING, TRADING, SERVICE, MIXED
-4. revenue_model_type: One of MANUFACTURING, TRADING, SERVICE_CAPACITY, SERVICE_TIME, SERVICE_SUBSCRIPTION, MIXED
-5. location_hint: Any location mentioned (city, state, region)
+        # ── Step 1: Detect business type + extract everything we can ─────────
+        extraction_prompt = (
+            "The user has sent their first message describing a business project. "
+            "Extract as much information as possible across ALL sections.\n\n"
+            f'User message: "{user_message}"\n\n'
+            "Extract:\n"
+            "1. business_description: 1-2 sentence clean description\n"
+            "2. industry: specific sector (e.g. Cricket Bat Manufacturing)\n"
+            "3. business_type: MANUFACTURING | TRADING | SERVICE | MIXED\n"
+            "4. revenue_model_type: MANUFACTURING | TRADING | SERVICE_CAPACITY | SERVICE_TIME | SERVICE_SUBSCRIPTION | MIXED\n"
+            "5. location_hint: any location mentioned\n"
+            "6. profile: {company_name, promoter_name, entity_type (Proprietorship/Partnership/LLP/Company), city, state, operation_start_date (YYYY-MM), projection_years}\n"
+            "7. capital: {assets: [{name, cost_lakhs, category (Civil Works/Plant & Machinery/Furniture & Fixture/Vehicle/Other)}], "
+            "term_loan_amount, term_loan_rate (fraction), term_loan_tenor_months, moratorium_months, od_limit, promoter_equity}\n"
+            "8. revenue: {products: [{name, unit, price_per_unit, capacity_per_day, output_ratio (default 1.0), split_percent}], "
+            "year1_utilization (fraction), annual_utilization_increment (fraction), max_utilization (fraction), working_days_per_month}\n"
+            "9. costs: {raw_materials: [{name, unit, price_per_unit, input_per_output_unit, price_escalation_pa (default 0.05)}], "
+            "transport_base_lakhs, misc_base_lakhs}\n"
+            "10. manpower: {categories: [{designation, count, monthly_salary_lakhs, annual_increment_pa (default 0.05)}]}\n"
+            "11. finance: {debtor_days, creditor_days_rm, stock_days_rm, implementation_months}\n\n"
+            "Return ONLY JSON. Use null for fields not mentioned. Numbers must be plain numbers (no ₹ symbol, no units in values).\n"
+            "{\"business_description\":\"...\",\"industry\":\"...\",\"business_type\":\"MANUFACTURING\","
+            "\"revenue_model_type\":\"MANUFACTURING\",\"location_hint\":\"...\","
+            "\"profile\":{\"company_name\":\"...\",\"promoter_name\":\"...\",\"entity_type\":\"...\","
+            "\"city\":\"...\",\"state\":\"...\",\"operation_start_date\":\"...\",\"projection_years\":7},"
+            "\"capital\":{\"assets\":[],\"term_loan_amount\":null,\"term_loan_rate\":null,"
+            "\"term_loan_tenor_months\":null,\"moratorium_months\":null,\"od_limit\":null,\"promoter_equity\":null},"
+            "\"revenue\":{\"products\":[],\"year1_utilization\":null,\"annual_utilization_increment\":null,"
+            "\"max_utilization\":null,\"working_days_per_month\":null},"
+            "\"costs\":{\"raw_materials\":[],\"transport_base_lakhs\":null,\"misc_base_lakhs\":null},"
+            "\"manpower\":{\"categories\":[]},"
+            "\"finance\":{\"debtor_days\":null,\"creditor_days_rm\":null,\"stock_days_rm\":null,\"implementation_months\":null}}"
+        )
 
-User message: "{user_message}"
-
-Respond ONLY with JSON:
-{{"business_description": "...", "industry": "...", "business_type": "...", "revenue_model_type": "...", "location_hint": "..."}}"""
-
-        raw = await self._llm_call(extraction_prompt, system=self._extraction_system())
-
+        raw = await self._llm_call(extraction_prompt, system=self._extraction_system(), max_tokens=2000)
         try:
             extracted = json.loads(self._clean_json(raw))
         except Exception:
-            extracted = {
-                "business_description": user_message,
-                "industry": "General MSME",
-                "business_type": "MANUFACTURING",
-                "revenue_model_type": "MANUFACTURING",
-                "location_hint": "",
-            }
+            extracted = {}
 
-        # Write to store
-        self.store.business_type = BusinessType(
-            extracted.get("business_type", "MANUFACTURING"))
-        self.store.revenue_model_type = RevenueModelType(
-            extracted.get("revenue_model_type", "MANUFACTURING"))
+        # ── Step 2: Write business type to store ─────────────────────────────
+        bt = extracted.get("business_type", "MANUFACTURING")
+        rm = extracted.get("revenue_model_type", "MANUFACTURING")
+        try:
+            self.store.business_type = BusinessType(bt)
+        except Exception:
+            self.store.business_type = BusinessType.MANUFACTURING
+        try:
+            self.store.revenue_model_type = RevenueModelType(rm)
+        except Exception:
+            self.store.revenue_model_type = RevenueModelType.MANUFACTURING
+
         self.store.project_profile.industry = extracted.get("industry", "")
         self._intake_description = extracted.get("business_description", user_message)
         self._intake_location    = extracted.get("location_hint", "India")
 
-        # Trigger benchmark generation immediately
+        # ── Step 3: Apply all sections that were found ────────────────────────
+        if extracted.get("profile"):
+            try:
+                self._apply_profile_fields(extracted["profile"])
+            except Exception as e:
+                print(f"[intake] profile extract error: {e}")
+
+        if extracted.get("capital"):
+            try:
+                self._apply_capital_fields_from_intake(extracted["capital"])
+            except Exception as e:
+                print(f"[intake] capital extract error: {e}")
+
+        if extracted.get("revenue"):
+            try:
+                self._apply_revenue_fields(extracted["revenue"])
+            except Exception as e:
+                print(f"[intake] revenue extract error: {e}")
+
+        if extracted.get("costs"):
+            try:
+                self._apply_costs_fields(extracted["costs"])
+            except Exception as e:
+                print(f"[intake] costs extract error: {e}")
+
+        if extracted.get("manpower"):
+            try:
+                self._apply_manpower_fields(extracted["manpower"])
+            except Exception as e:
+                print(f"[intake] manpower extract error: {e}")
+
+        if extracted.get("finance"):
+            try:
+                self._apply_finance_fields(extracted["finance"])
+            except Exception as e:
+                print(f"[intake] finance extract error: {e}")
+
+        # ── Step 4: Run benchmark engine ──────────────────────────────────────
         be = BenchmarkEngine(self.model, api_key=self.api_key)
         self.benchmarks = await be.generate(
             business_description=self._intake_description,
             industry=self.store.project_profile.industry,
             location=self._intake_location,
-            project_cost_lakhs=0.0,   # not known yet; will refine after capital section
+            project_cost_lakhs=self.store.capital_means.total_cost,
         )
 
-        # Move to profile section
-        self.current_section = "profile"
+        # ── Step 5: Mark sections complete if all fields present, advance ─────
+        self._auto_complete_sections()
 
-        # Build confirmation + first question
+        # ── Step 6: Build response — jump to first incomplete section ─────────
         reply = self._build_intake_confirmation(extracted)
         return OrchestratorResponse(
             message=reply,
             section_completed="intake",
-            next_section="profile",
+            next_section=self.current_section,
         )
+
+    def _apply_capital_fields_from_intake(self, d: dict):
+        """Apply capital fields extracted during intake."""
+        from core.session_store import Asset, FinanceSource, AssetCategory, FinanceSourceType
+        cm = self.store.capital_means
+
+        # Assets
+        cat_map = {
+            "civil": AssetCategory.CIVIL_WORKS,
+            "plant": AssetCategory.PLANT_MACHINERY,
+            "machinery": AssetCategory.PLANT_MACHINERY,
+            "furniture": AssetCategory.FURNITURE,
+            "vehicle": AssetCategory.VEHICLE,
+            "electrical": AssetCategory.ELECTRICAL,
+        }
+        for a in (d.get("assets") or []):
+            name = a.get("name", "")
+            cost = float(a.get("cost_lakhs") or 0)
+            if cost <= 0:
+                continue
+            cat_hint = a.get("category", name).lower()
+            category = AssetCategory.OTHER
+            for k, v in cat_map.items():
+                if k in cat_hint:
+                    category = v
+                    break
+            cm.assets.append(Asset(name=name, category=category, cost_lakhs=cost))
+
+        # Finance sources
+        if d.get("term_loan_amount"):
+            cm.finance_sources.append(FinanceSource(
+                source_type=FinanceSourceType.TERM_LOAN,
+                amount_lakhs=float(d["term_loan_amount"]),
+                interest_rate=float(d.get("term_loan_rate") or 0.095),
+                tenor_months=int(d.get("term_loan_tenor_months") or 84),
+                moratorium_months=int(d.get("moratorium_months") or 0),
+            ))
+        if d.get("od_limit"):
+            cm.finance_sources.append(FinanceSource(
+                source_type=FinanceSourceType.OD_LIMIT,
+                amount_lakhs=float(d["od_limit"]),
+                interest_rate=float(d.get("term_loan_rate") or 0.095),
+            ))
+        if d.get("promoter_equity"):
+            cm.finance_sources.append(FinanceSource(
+                source_type=FinanceSourceType.PROMOTER_EQUITY,
+                amount_lakhs=float(d["promoter_equity"]),
+            ))
+
+    def _apply_manpower_fields(self, d: dict):
+        """Apply manpower fields."""
+        from core.session_store import EmployeeCategory
+        mp = self.store.manpower
+        for c in (d.get("categories") or []):
+            desig = c.get("designation", "")
+            if not desig:
+                continue
+            mp.categories.append(EmployeeCategory(
+                designation=desig,
+                count=int(c.get("count") or 1),
+                monthly_salary_lakhs=float(c.get("monthly_salary_lakhs") or 0.15),
+                is_fixed=True,
+                annual_increment_pa=float(c.get("annual_increment_pa") or 0.05),
+            ))
+
+    def _apply_finance_fields(self, d: dict):
+        """Apply working capital fields."""
+        fw = self.store.finance_wc
+        if d.get("debtor_days") is not None:
+            fw.debtor_days = int(d["debtor_days"])
+        if d.get("creditor_days_rm") is not None:
+            fw.creditor_days_rm = int(d["creditor_days_rm"])
+        if d.get("stock_days_rm") is not None:
+            fw.stock_days_rm = int(d["stock_days_rm"])
+        if d.get("implementation_months") is not None:
+            fw.implementation_months = int(d["implementation_months"])
+
+    def _auto_complete_sections(self):
+        """Mark sections complete if all required fields are present, and advance current_section."""
+        sections_in_order = ["profile", "capital", "revenue", "costs", "manpower", "finance", "confirm"]
+
+        # Profile
+        if not self._missing_profile_fields():
+            self.store.project_profile.status = SectionStatus.COMPLETE
+
+        # Capital
+        if self.store.capital_means.assets and self.store.capital_means.finance_sources:
+            self.store.capital_means.status = SectionStatus.COMPLETE
+
+        # Revenue
+        if not self._missing_revenue_fields():
+            self.store.revenue_model.status = SectionStatus.COMPLETE
+
+        # Costs
+        if not self._missing_costs_fields():
+            self.store.cost_structure.status = SectionStatus.COMPLETE
+
+        # Manpower
+        if self.store.manpower.categories:
+            self.store.manpower.status = SectionStatus.COMPLETE
+
+        # Finance/WC
+        fw = self.store.finance_wc
+        if fw.debtor_days != -1 and fw.creditor_days_rm != -1 and fw.implementation_months != -1:
+            self.store.finance_wc.status = SectionStatus.COMPLETE
+
+        # Set current_section to first incomplete section
+        status_map = {
+            "profile":  self.store.project_profile.status,
+            "capital":  self.store.capital_means.status,
+            "revenue":  self.store.revenue_model.status,
+            "costs":    self.store.cost_structure.status,
+            "manpower": self.store.manpower.status,
+            "finance":  self.store.finance_wc.status,
+        }
+        for sec in sections_in_order[:-1]:
+            if status_map.get(sec) != SectionStatus.COMPLETE:
+                self.current_section = sec
+                return
+        # All complete
+        self.current_section = "confirm"
 
     async def _handle_profile(self, user_message: str) -> "OrchestratorResponse":
         """Extract project profile fields from conversation."""
@@ -931,15 +1112,54 @@ Or {{}} if user accepted all defaults."""
     def _build_intake_confirmation(self, extracted: dict) -> str:
         biz_type = extracted.get("business_type", "MANUFACTURING").replace("_", " ").title()
         industry = extracted.get("industry", "")
-        return (
+
+        # Build a summary of what was already captured
+        completed = []
+        pp = self.store.project_profile
+        cm = self.store.capital_means
+        rv = self.store.revenue_model
+        cs = self.store.cost_structure
+        mp = self.store.manpower
+        fw = self.store.finance_wc
+
+        if pp.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Project profile ({pp.company_name}, {pp.city})")
+        if cm.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Capital & means ({len(cm.assets)} assets, ₹{cm.total_project_cost:.0f}L project cost)")
+        if rv.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Revenue model ({len(rv.products)} products)")
+        if cs.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Cost structure ({len(cs.raw_materials)} raw materials)")
+        if mp.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Manpower ({len(mp.categories)} categories)")
+        if fw.status == SectionStatus.COMPLETE:
+            completed.append(f"✅ Working capital (debtor days: {fw.debtor_days})")
+
+        intro = (
             f"Got it. I understand you're setting up a **{industry}** unit "
             f"({biz_type} type business).\n\n"
-            f"I've already generated industry-specific benchmarks for your financial assumptions "
-            f"— you'll see those as suggested defaults as we go through the questions.\n\n"
-            f"Let's build your DPR step by step. It'll take about 10–15 minutes.\n\n"
-            f"---\n\n"
-            f"{self._first_question_for('profile')}"
+            f"I've generated industry-specific benchmarks for your financial assumptions.\n\n"
         )
+
+        if completed:
+            intro += f"**Already extracted from your message:**\n" + "\n".join(completed) + "\n\n"
+
+        if self.current_section == "confirm":
+            intro += "🎉 All sections complete! Here's your full summary for confirmation:\n\n"
+            intro += self._full_summary_for_confirmation()
+        else:
+            first_q = self._first_question_for(self.current_section)
+            missing_label = {
+                "profile": "project details",
+                "capital": "capital & finance",
+                "revenue": "revenue model",
+                "costs": "cost structure",
+                "manpower": "manpower",
+                "finance": "working capital",
+            }.get(self.current_section, self.current_section)
+            intro += f"Still need a few details about your **{missing_label}**:\n\n---\n\n{first_q}"
+
+        return intro
 
     def _profile_summary(self) -> str:
         pp = self.store.project_profile
