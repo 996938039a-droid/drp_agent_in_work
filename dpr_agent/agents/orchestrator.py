@@ -826,14 +826,15 @@ Or {{}} if user accepted all defaults."""
     # ── LLM call ──────────────────────────────────────────────────────────────
 
     async def _llm_call(self, user_prompt: str,
-                         system: str = "") -> str:
+                         system: str = "",
+                         max_tokens: int = 2000) -> str:
         """Make a Claude API call and return the text response."""
         import aiohttp
 
         messages = [{"role": "user", "content": user_prompt}]
         payload = {
             "model": self.model,
-            "max_tokens": 1500,
+            "max_tokens": max_tokens,
             "messages": messages,
         }
         if system:
