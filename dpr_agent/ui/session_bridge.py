@@ -141,21 +141,25 @@ class SessionBridge:
         # Add user message to history
         self.add_message("user", user_text)
 
-        # Run the orchestrator (sync wrapper)
+        # Streamlit runs in ScriptRunner.scriptThread which has NO event loop.
+        # Safe fix: always run the coroutine in a brand-new thread with its own loop.
         import asyncio
         import concurrent.futures
 
         async def _run():
             return await orch.process_message(user_text)
 
+        def _run_in_new_loop():
+            return asyncio.run(_run())
+
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, _run())
-                    response = future.result(timeout=60)
-            else:
-                response = loop.run_until_complete(_run())
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_run_in_new_loop)
+                response = future.result(timeout=90)
+        except concurrent.futures.TimeoutError:
+            reply = "⚠️ Request timed out. Please try again."
+            self.add_message("assistant", reply)
+            return reply
         except Exception as e:
             reply = f"⚠️ Error processing message: {str(e)}"
             self.add_message("assistant", reply)
